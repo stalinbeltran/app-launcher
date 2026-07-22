@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
 
 # Estado en memoria de apps corriendo.  id -> dict
 RUNNING = {}
+# Puertos reservados durante la ventana entre asignar y que el proceso los enlace.
+RESERVED = set()
 LOCK = threading.Lock()
 
 
@@ -80,8 +82,10 @@ def resolve_root(root):
 # Puertos
 # --------------------------------------------------------------------------- #
 def is_free(port):
+    # OJO: NO usar SO_REUSEADDR aqui. En Windows, REUSEADDR permite enlazar a un
+    # puerto que YA esta en uso, con lo que is_free daria True para un puerto
+    # ocupado y dos apps terminarian compartiendo puerto.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("127.0.0.1", port))
             return True
@@ -216,13 +220,19 @@ def launch_app(app_id):
     if not app["processes"]:
         return False, "El manifiesto no declara 'processes'."
 
-    # Asignar puertos
-    port_map = {}
-    used = set()
-    for name, preferred in app["ports_decl"]:
-        p = alloc_port(preferred, exclude=used)
-        used.add(p)
-        port_map[name] = p
+    # Asignar puertos de forma atomica: excluir los que ya usan otras apps
+    # corriendo y los reservados por lanzamientos en curso, y reservar los
+    # nuevos de inmediato para que dos apps nunca reciban el mismo puerto.
+    with LOCK:
+        taken = set(RESERVED)
+        for st in RUNNING.values():
+            taken.update(st["ports"].values())
+        port_map = {}
+        for name, preferred in app["ports_decl"]:
+            p = alloc_port(preferred, exclude=taken)
+            taken.add(p)
+            port_map[name] = p
+        RESERVED.update(port_map.values())
 
     os.makedirs(LOG_DIR, exist_ok=True)
     procs = []
@@ -255,10 +265,14 @@ def launch_app(app_id):
             _kill(p)
         for fh, _ in logs:
             fh.close()
+        with LOCK:
+            RESERVED.difference_update(port_map.values())
         return False, f"Error al lanzar: {exc}"
 
     open_url = substitute(app["open"], port_map)
     with LOCK:
+        # Ya viven en RUNNING; su exclusion pasa a derivarse de ahi.
+        RESERVED.difference_update(port_map.values())
         RUNNING[app_id] = {
             "procs": procs,
             "logs": logs,
@@ -426,9 +440,11 @@ def cleanup_on_exit():
 def main():
     port = CONFIG.get("port", 8765)
     server = None
+    fallback = False
     for candidate in range(port, port + 20):
         try:
             server = ThreadingHTTPServer(("127.0.0.1", candidate), Handler)
+            fallback = candidate != port
             port = candidate
             break
         except OSError:
@@ -436,6 +452,14 @@ def main():
     if server is None:
         print("[error] no se encontro puerto libre para el launcher.")
         sys.exit(1)
+
+    if fallback:
+        print("!" * 60)
+        print(f"  AVISO: el puerto {CONFIG.get('port', 8765)} estaba ocupado.")
+        print(f"  Probablemente hay OTRO launcher aun corriendo. Este arranco")
+        print(f"  en el puerto {port}. Cierra el launcher viejo (o su terminal)")
+        print(f"  para evitar hablarle a la instancia equivocada.")
+        print("!" * 60)
 
     url = f"http://127.0.0.1:{port}/"
     print("=" * 60)
@@ -532,6 +556,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let APPS = [];
 let sortKey = "date";
+const openLogs = new Set();  // ids de apps cuyo panel de log esta abierto
 
 async function fetchApps() {
   const r = await fetch("/api/apps");
@@ -585,11 +610,25 @@ function render() {
           ? `<button class="danger" data-stop="${esc(a.id)}">Detener</button>`
           : `<button class="primary" data-launch="${esc(a.id)}" ${a.error?'disabled':''}>Lanzar</button>`}
         ${a.running && openUrl ? `<a href="${esc(openUrl)}" target="_blank"><button class="primary">Abrir</button></a>` : ""}
-        <button data-logs="${esc(a.id)}">Logs</button>
+        <button data-logs="${esc(a.id)}">${openLogs.has(a.id) ? "Ocultar logs" : "Logs"}</button>
       </div>
       <pre class="logs" id="logs-${esc(a.id)}"></pre>`;
     main.appendChild(card);
   }
+  // Restaurar paneles de log que estaban abiertos (sobreviven al redibujado).
+  for (const id of openLogs) loadLogs(id);
+}
+
+async function loadLogs(id) {
+  const pre = document.getElementById("logs-" + id);
+  if (!pre) return;
+  // Mantener la posicion si el usuario subio a leer; auto-scroll solo si esta abajo.
+  const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+  const r = await fetch("/api/logs?id=" + encodeURIComponent(id));
+  const d = await r.json();
+  pre.textContent = d.logs;
+  pre.style.display = "block";
+  if (atBottom) pre.scrollTop = pre.scrollHeight;
 }
 
 async function launch(id, btn) {
@@ -609,14 +648,10 @@ async function stop(id) {
   await fetchApps();
 }
 
-async function toggleLogs(id) {
-  const pre = document.getElementById("logs-" + id);
-  if (pre.style.display === "block") { pre.style.display = "none"; return; }
-  const r = await fetch("/api/logs?id=" + encodeURIComponent(id));
-  const d = await r.json();
-  pre.textContent = d.logs;
-  pre.style.display = "block";
-  pre.scrollTop = pre.scrollHeight;
+function toggleLogs(id) {
+  if (openLogs.has(id)) openLogs.delete(id);
+  else openLogs.add(id);
+  render();
 }
 
 document.getElementById("main").addEventListener("click", e => {

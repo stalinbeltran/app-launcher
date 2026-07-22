@@ -1,0 +1,16 @@
+{
+  "name": "APP TWO (demo colision)",
+  "description": "Prefiere el mismo puerto 4500 que hello-app, para probar que el launcher evita colisiones.",
+  "processes": [
+    {
+      "name": "server",
+      "cwd": "web",
+      "cmd": "python server.py --port {PORT_WEB}"
+    }
+  ],
+  "ports": [
+    { "name": "PORT_WEB", "preferred": 4500 }
+  ],
+  "open": "http://localhost:{PORT_WEB}",
+  "registered_at": "2026-07-22T09:30:00Z"
+}
