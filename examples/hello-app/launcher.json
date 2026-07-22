@@ -1,0 +1,18 @@
+{
+  "name": "Hello App (demo)",
+  "description": "App de ejemplo: proceso que corre en la subcarpeta web/ y comparte puertos asignados.",
+  "processes": [
+    {
+      "name": "server",
+      "cwd": "web",
+      "cmd": "python server.py --port {PORT_WEB} --api {PORT_API}",
+      "env": { "API_PORT": "{PORT_API}" }
+    }
+  ],
+  "ports": [
+    { "name": "PORT_WEB", "preferred": 4500 },
+    "PORT_API"
+  ],
+  "open": "http://localhost:{PORT_WEB}",
+  "registered_at": "2026-07-22T09:00:00Z"
+}
