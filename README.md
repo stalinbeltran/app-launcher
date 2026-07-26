@@ -161,6 +161,25 @@ Se crea solo la primera vez. Valores por defecto:
 - `port`: puerto del launcher (si está ocupado, prueba los siguientes).
 - `port_range`: rango de puertos que puede asignar a las apps.
 
+## Apagar un proceso por su puerto
+
+En la cabecera hay un cuadro **Puerto** y un botón **Apagar puerto**. Escribe el
+número de puerto (1-65535) y pulsa el botón (o Enter): el launcher busca cualquier
+proceso que esté ocupando ese puerto y lo detiene, aunque no lo haya lanzado él.
+
+- Funciona en Windows (vía `netstat` + `taskkill`) y Linux (`lsof`/`ss` + `kill`).
+- Pide confirmación antes de matar.
+- Si el proceso pertenece a una app lanzada por el launcher, su tarjeta pasa a
+  mostrarse como detenida.
+
+## Puertos ocupados por cada app
+
+Cada tarjeta muestra sus puertos en la línea **Puertos**:
+
+- Si la app está **detenida**, se ven los nombres declarados (`PORT_API`, `PORT_WEB`).
+- Si está **corriendo**, se ve el puerto **real** asignado a cada nombre
+  (p.ej. `PORT_WEB: 5173`), que es justo el que puedes escribir arriba para apagarla.
+
 ## Ordenar
 
 En la web puedes ordenar por **fecha de ingreso** (recientes primero, por

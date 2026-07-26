@@ -81,16 +81,39 @@ def resolve_root(root):
 # --------------------------------------------------------------------------- #
 # Puertos
 # --------------------------------------------------------------------------- #
+def _ipv6_available():
+    """Hay pila IPv6 utilizable? Se calcula una vez, no en cada is_free()."""
+    if not socket.has_ipv6:
+        return False
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+        return True
+    except OSError:
+        return False
+
+
+HAS_IPV6 = _ipv6_available()
+
+
 def is_free(port):
     # OJO: NO usar SO_REUSEADDR aqui. En Windows, REUSEADDR permite enlazar a un
     # puerto que YA esta en uso, con lo que is_free daria True para un puerto
     # ocupado y dos apps terminarian compartiendo puerto.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return True
-        except OSError:
-            return False
+    #
+    # Hay que mirar IPv4 *y* IPv6: Node (y por tanto Vite) escucha en "localhost",
+    # que resuelve primero a ::1, asi que un puerto puede estar ocupado SOLO en
+    # IPv6. Comprobando nada mas 127.0.0.1 lo dabamos por libre, se lo asignabamos
+    # al front y este moria al arrancar con "Port N is already in use".
+    families = [(socket.AF_INET, "127.0.0.1")]
+    if HAS_IPV6:
+        families.append((socket.AF_INET6, "::1"))
+    for family, addr in families:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((addr, port))
+            except OSError:
+                return False
+    return True
 
 
 def alloc_port(preferred=None, exclude=frozenset()):
@@ -103,12 +126,18 @@ def alloc_port(preferred=None, exclude=frozenset()):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             p = s.getsockname()[1]
-        if lo <= p <= hi and p not in exclude:
+        if lo <= p <= hi and p not in exclude and is_free(p):
             return p
-    # fallback: cualquier puerto que de el SO
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    # Fallback: cualquier puerto que de el SO. Pasa por is_free igual que el resto:
+    # el SO lo elige mirando solo IPv4, y en Windows los puertos efimeros caen
+    # fuera de port_range, asi que en la practica casi todos salen por aqui.
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            p = s.getsockname()[1]
+        if p not in exclude and is_free(p):
+            return p
+    return p
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +322,119 @@ def spawn(cmd, cwd, env, log_fh):
     return subprocess.Popen(cmd, **kwargs)
 
 
+def pids_on_port(port):
+    """Devuelve el conjunto de PIDs que tienen abierto (LISTEN/ocupado) `port`.
+
+    Multiplataforma sin dependencias externas: parsea `netstat` en Windows y usa
+    `lsof`/`ss` en Linux.
+    """
+    pids = set()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return pids
+
+    if os.name == "nt":
+        try:
+            # Sin `-p TCP`: ese filtro deja fuera las escuchas IPv6 (TCPv6), que es
+            # justo como escucha Node/Vite ("localhost" -> ::1). Con el filtro, un
+            # front en [::1]:5173 era invisible y "Apagar puerto" no podia matarlo.
+            # Listamos todo y nos quedamos con las filas TCP de ambas familias.
+            out = subprocess.run(["netstat", "-ano"],
+                                 capture_output=True, text=True).stdout
+        except Exception:
+            return pids
+        for line in out.splitlines():
+            parts = line.split()
+            # Formato: Proto  Local  Remote  Estado  PID  (las filas UDP no traen
+            # Estado, se caen solas por el len).
+            if len(parts) < 5 or parts[0].upper() != "TCP":
+                continue
+            local = parts[1]
+            # El puerto es lo que va tras el ultimo ':' de la direccion local;
+            # sirve igual para "127.0.0.1:5173" que para "[::1]:5173".
+            if local.rsplit(":", 1)[-1] != str(port):
+                continue
+            pid = parts[-1]
+            if pid.isdigit() and pid != "0":
+                pids.add(pid)
+    else:
+        # Preferir lsof; si no esta, caer a ss.
+        try:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{port}"],
+                                 capture_output=True, text=True).stdout
+            for line in out.split():
+                if line.strip().isdigit():
+                    pids.add(line.strip())
+        except FileNotFoundError:
+            try:
+                out = subprocess.run(["ss", "-ltnp", f"( sport = :{port} )"],
+                                     capture_output=True, text=True).stdout
+                for m in re.finditer(r"pid=(\d+)", out):
+                    pids.add(m.group(1))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return pids
+
+
+def kill_by_port(port):
+    """Mata cualquier proceso que ocupe `port`. Devuelve (ok, mensaje)."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False, "Puerto invalido."
+    if not (0 < port < 65536):
+        return False, "El puerto debe estar entre 1 y 65535."
+
+    pids = pids_on_port(port)
+    if not pids:
+        return False, f"No hay ningun proceso escuchando en el puerto {port}."
+
+    killed, failed = [], []
+    for pid in pids:
+        try:
+            if os.name == "nt":
+                r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                (killed if r.returncode == 0 else failed).append(pid)
+            else:
+                import signal
+                os.kill(int(pid), signal.SIGKILL)
+                killed.append(pid)
+        except Exception:
+            failed.append(pid)
+
+    # Si alguno de los PIDs muertos pertenece a una app lanzada por el launcher,
+    # limpiar su estado para que la UI la muestre como detenida.
+    _forget_apps_with_pids(killed)
+
+    if killed and not failed:
+        return True, f"Puerto {port} liberado. PID(s) detenido(s): {', '.join(killed)}."
+    if killed and failed:
+        return True, (f"Puerto {port}: detenidos {', '.join(killed)}; "
+                      f"no se pudo con {', '.join(failed)}.")
+    return False, f"No se pudo detener el/los proceso(s) en el puerto {port}: {', '.join(failed)}."
+
+
+def _forget_apps_with_pids(pids):
+    """Quita de RUNNING las apps cuyos procesos ya no viven tras un kill externo."""
+    pidset = {str(p) for p in pids}
+    with LOCK:
+        for app_id in list(RUNNING.keys()):
+            state = RUNNING[app_id]
+            app_pids = {str(p.pid) for p in state["procs"]}
+            # Si matamos alguno de sus PIDs, o ya ninguno vive, olvidarla.
+            if app_pids & pidset or all(p.poll() is not None for p in state["procs"]):
+                RUNNING.pop(app_id, None)
+                for fh, _ in state["logs"]:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+
 def _kill(popen):
     try:
         if popen.poll() is not None:
@@ -428,6 +570,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/stop":
             ok, res = stop_app(app_id)
             self._json(200 if ok else 400, {"ok": ok, "result": res})
+        elif parsed.path == "/api/kill-port":
+            ok, res = kill_by_port(body.get("port"))
+            self._json(200 if ok else 400, {"ok": ok, "result": res})
         else:
             self._json(404, {"error": "no encontrado"})
 
@@ -508,8 +653,10 @@ INDEX_HTML = r"""<!doctype html>
   .count { color:var(--mut); font-size:13px; }
   .spacer { flex:1; }
   .controls { display:flex; gap:8px; align-items:center; }
-  button, select { font:inherit; color:var(--fg); background:var(--card2);
+  button, select, input { font:inherit; color:var(--fg); background:var(--card2);
     border:1px solid var(--line); border-radius:8px; padding:7px 12px; cursor:pointer; }
+  input { cursor:text; width:100px; }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   button.danger { background:transparent; color:var(--red); border-color:var(--red); }
@@ -543,6 +690,9 @@ INDEX_HTML = r"""<!doctype html>
   <span class="count" id="count"></span>
   <div class="spacer"></div>
   <div class="controls">
+    <input id="killport" type="number" min="1" max="65535" placeholder="Puerto"
+           title="Puerto a liberar" />
+    <button id="killbtn" class="danger" title="Detiene cualquier proceso que ocupe ese puerto">Apagar puerto</button>
     <label class="count">Ordenar:</label>
     <select id="sort">
       <option value="date">Fecha de ingreso (recientes primero)</option>
@@ -589,7 +739,13 @@ function render() {
   for (const a of sortApps(APPS)) {
     const card = document.createElement("div");
     card.className = "card" + (a.running ? " live" : "");
-    const portsTxt = a.ports.length ? a.ports.join(", ") : "ninguno";
+    // Cuando la app corre, mostrar el puerto REAL asignado a cada nombre
+    // (p.ej. "PORT_WEB: 5173"); si no, solo los nombres declarados.
+    let portsTxt;
+    if (a.running && a.live_ports && Object.keys(a.live_ports).length)
+      portsTxt = Object.entries(a.live_ports).map(([k,v]) => `${k}: ${v}`).join(", ");
+    else
+      portsTxt = a.ports.length ? a.ports.join(", ") : "ninguno";
     const openUrl = a.running ? a.live_open : a.open;
     card.innerHTML = `
       <div class="top">
@@ -661,13 +817,42 @@ document.getElementById("main").addEventListener("click", e => {
   else if (b.dataset.stop) stop(b.dataset.stop);
   else if (b.dataset.logs) toggleLogs(b.dataset.logs);
 });
+async function killPort() {
+  const inp = document.getElementById("killport");
+  const btn = document.getElementById("killbtn");
+  const port = parseInt(inp.value, 10);
+  if (!port || port < 1 || port > 65535) {
+    alert("Ingresa un puerto valido (1-65535).");
+    inp.focus();
+    return;
+  }
+  if (!confirm("Detener cualquier proceso que ocupe el puerto " + port + "?")) return;
+  btn.disabled = true; btn.textContent = "Apagando...";
+  try {
+    const r = await fetch("/api/kill-port", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({port})});
+    const d = await r.json();
+    alert(d.result);
+    if (d.ok) inp.value = "";
+  } catch (e) {
+    alert("Error: " + e);
+  } finally {
+    btn.disabled = false; btn.textContent = "Apagar puerto";
+    await fetchApps();
+  }
+}
+
+document.getElementById("killbtn").addEventListener("click", killPort);
+document.getElementById("killport").addEventListener("keydown", e => {
+  if (e.key === "Enter") killPort();
+});
 document.getElementById("sort").addEventListener("change", e => {
   sortKey = e.target.value; render();
 });
 document.getElementById("refresh").addEventListener("click", fetchApps);
 
 fetchApps();
-setInterval(fetchApps, 3000);  // refresca estado de apps corriendo
+setInterval(fetchApps, 30000);  // refresca estado de apps corriendo
 </script>
 </body>
 </html>"""
